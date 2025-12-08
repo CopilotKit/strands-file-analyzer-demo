@@ -36,14 +36,14 @@ export default function FileInvestigatorPage() {
     stateRef.current = state;
   }, [state]);
 
-  // Handle file upload
-  const handleFileUpload = useCallback(
-    (file: UploadedFile | null) => {
+  // Handle files change
+  const handleFilesChange = useCallback(
+    (files: UploadedFile[]) => {
       setState({
         ...state,
-        uploadedFile: file,
-        analysisStatus: file ? "idle" : "idle",
-        // Reset results when new file uploaded
+        uploadedFiles: files,
+        analysisStatus: "idle",
+        // Reset results when files change
         findings: [],
         redactedContent: [],
         tweets: [],
@@ -139,8 +139,8 @@ export default function FileInvestigatorPage() {
             {/* File Upload */}
             <div className="flex-shrink-0 mb-6">
               <FileUpload
-                onFileUpload={handleFileUpload}
-                currentFile={state.uploadedFile}
+                onFilesChange={handleFilesChange}
+                currentFiles={state.uploadedFiles}
               />
             </div>
 

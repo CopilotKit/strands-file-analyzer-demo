@@ -2,6 +2,7 @@ export interface UploadedFile {
   name: string;
   base64: string;
   mimeType: string;
+  sizeBytes: number;
 }
 
 export interface Finding {
@@ -27,7 +28,7 @@ export interface Tweet {
 export type AnalysisStatus = 'idle' | 'proposed' | 'analyzing' | 'complete';
 
 export interface FileInvestigatorState {
-  uploadedFile: UploadedFile | null;
+  uploadedFiles: UploadedFile[];
   findings: Finding[];
   redactedContent: RedactedItem[];
   tweets: Tweet[];
@@ -36,7 +37,7 @@ export interface FileInvestigatorState {
 }
 
 export const INITIAL_STATE: FileInvestigatorState = {
-  uploadedFile: null,
+  uploadedFiles: [],
   findings: [],
   redactedContent: [],
   tweets: [],

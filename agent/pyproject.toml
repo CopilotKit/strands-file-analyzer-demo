@@ -13,4 +13,5 @@ dependencies = [
     "strands-agents-tools>=0.2.14",
     "ag_ui_strands==0.1.0b12",
     "python-dotenv>=1.0.0",
+    "pypdf>=4.0.0",
 ]

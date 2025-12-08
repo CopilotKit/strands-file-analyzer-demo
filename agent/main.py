@@ -100,6 +100,7 @@ from ag_ui_strands import (
     create_strands_app,
 )
 from dotenv import load_dotenv
+from pdf_utils import extract_text_from_pdf, format_extracted_files_as_xml
 from pydantic import BaseModel, Field
 from strands import Agent, tool
 from strands.models import BedrockModel
@@ -314,7 +315,7 @@ def _sanitize_document_name(name: str) -> str:
 
 
 def build_investigator_prompt(input_data, user_message: str):
-    """Inject file and analysis state into the prompt."""
+    """Inject files and analysis state into the prompt."""
     logger = logging.getLogger("agent.context")
     logger.info(f"build_investigator_prompt called with message: {user_message[:100]}...")
 
@@ -327,52 +328,74 @@ def build_investigator_prompt(input_data, user_message: str):
 
     context_parts = []
     content_blocks = []
+    extracted_texts = []  # For files > 4.5MB or overflow beyond 5-doc limit
 
-    # Bedrock max document size is 4.5 MB
+    # Bedrock limits
     MAX_DOCUMENT_SIZE_MB = 4.5
     MAX_DOCUMENT_SIZE_BYTES = int(MAX_DOCUMENT_SIZE_MB * 1024 * 1024)
+    MAX_NATIVE_DOCUMENTS = 5  # Bedrock limit per message
 
     if isinstance(state_dict, dict):
-        if state_dict.get("uploadedFile"):
-            file_info = state_dict["uploadedFile"]
+        uploaded_files = state_dict.get("uploadedFiles", [])
+        native_doc_count = 0  # Track documents sent as native PDF
+
+        for file_info in uploaded_files:
             file_name = file_info.get("name", "document.pdf")
             base64_data = file_info.get("base64", "")
 
-            if base64_data:
-                try:
-                    pdf_bytes = base64.b64decode(base64_data)
-                    file_size_mb = len(pdf_bytes) / (1024 * 1024)
+            if not base64_data:
+                continue
 
-                    # Check file size before sending to Bedrock
-                    if len(pdf_bytes) > MAX_DOCUMENT_SIZE_BYTES:
-                        logger.warning(f"PDF too large: {file_size_mb:.1f}MB (max {MAX_DOCUMENT_SIZE_MB}MB)")
-                        context_parts.append(
-                            f"ERROR: The uploaded file '{file_name}' is {file_size_mb:.1f}MB, "
-                            f"which exceeds Bedrock's {MAX_DOCUMENT_SIZE_MB}MB limit. "
-                            "Please upload a smaller PDF file."
-                        )
+            try:
+                pdf_bytes = base64.b64decode(base64_data)
+                file_size_mb = len(pdf_bytes) / (1024 * 1024)
+
+                # Determine if we should extract text:
+                # 1. File > 4.5MB (too large for Bedrock)
+                # 2. Already have 5 native docs (Bedrock limit)
+                should_extract = (
+                    len(pdf_bytes) > MAX_DOCUMENT_SIZE_BYTES
+                    or native_doc_count >= MAX_NATIVE_DOCUMENTS
+                )
+
+                if should_extract:
+                    reason = "size" if len(pdf_bytes) > MAX_DOCUMENT_SIZE_BYTES else "doc limit"
+                    logger.info(f"Extracting text from PDF ({reason}): {file_name} ({file_size_mb:.1f}MB)")
+                    text = extract_text_from_pdf(pdf_bytes, file_name)
+
+                    if text:
+                        extracted_texts.append({"name": file_name, "content": text})
+                        context_parts.append(f"File: {file_name} ({file_size_mb:.1f}MB) - text extracted ({reason})")
                     else:
-                        # Sanitize filename for Bedrock API requirements
-                        # Append unique suffix to avoid "duplicate document names" error
-                        # when same PDF is sent across multiple messages in conversation
-                        safe_name = _sanitize_document_name(file_name)
-                        unique_name = f"{safe_name}-{uuid.uuid4().hex[:8]}"
-                        content_blocks.append(
-                            {
-                                "document": {
-                                    "format": "pdf",
-                                    "name": unique_name,
-                                    "source": {"bytes": pdf_bytes},
-                                },
-                            }
-                        )
-                        context_parts.append(f"Uploaded file: {file_name} ({file_size_mb:.1f}MB)")
-                except Exception as e:
-                    logger.error(f"Failed to decode PDF: {e}")
-                    context_parts.append(f"Uploaded file: {file_name} (decode error: {e})")
+                        context_parts.append(f"File: {file_name} - text extraction failed")
+                else:
+                    # Small file within limit: send as PDF document block
+                    safe_name = _sanitize_document_name(file_name)
+                    unique_name = f"{safe_name}-{uuid.uuid4().hex[:8]}"
+                    content_blocks.append(
+                        {
+                            "document": {
+                                "format": "pdf",
+                                "name": unique_name,
+                                "source": {"bytes": pdf_bytes},
+                            },
+                        }
+                    )
+                    native_doc_count += 1
+                    context_parts.append(f"File: {file_name} ({file_size_mb:.1f}MB) - native PDF")
+
+            except Exception as e:
+                logger.error(f"Failed to process {file_name}: {e}")
+                context_parts.append(f"File: {file_name} (error: {e})")
+
+        # Add extracted text as XML if any
+        if extracted_texts:
+            xml_content = format_extracted_files_as_xml(extracted_texts)
+            context_parts.append(f"\nExtracted text from {len(extracted_texts)} large file(s):")
+            context_parts.append(xml_content)
 
         status = state_dict.get("analysisStatus", "idle")
-        context_parts.append(f"Analysis status: {status}")
+        context_parts.append(f"\nAnalysis status: {status}")
 
         if state_dict.get("findings"):
             context_parts.append(
@@ -388,7 +411,7 @@ def build_investigator_prompt(input_data, user_message: str):
 
     if content_blocks:
         content_blocks.append({"text": full_text})
-        logger.info(f"Returning multimodal content with {len(content_blocks)} blocks")
+        logger.info(f"Returning multimodal content with {len(content_blocks)} blocks ({native_doc_count} native PDFs)")
         return content_blocks
 
     logger.info(f"Returning text-only prompt ({len(full_text)} chars)")
@@ -604,32 +627,35 @@ SYSTEM_PROMPT = """You are the File Investigator - a sardonic document analyst w
 PERSONALITY: World-weary investigative journalist. Dry wit about redactions and bureaucracy.
 Slightly conspiratorial but self-aware. Treat every document like it might hide secrets.
 
-When analyzing a PDF:
+When analyzing PDFs (you may receive multiple files):
 
-1. Ask briefly if user wants to proceed
-2. Call the update_* tools to populate the dashboard panels
+1. If multiple files, briefly acknowledge the collection
+2. Look for connections and patterns across documents
+3. Call the update_* tools to populate the dashboard panels
 
 **KEY FINDINGS** (update_findings):
-- MAX 3-5 truly important points only
+- MAX 3-5 truly important points across ALL documents
+- Cross-reference between files when relevant
 - One sentence each, be punchy
-- Don't restate everything - only what matters
 
 **REDACTED CONTENT** (update_redacted):
-- Note actual redactions/gaps found
+- Note actual redactions/gaps found in any document
+- Specify which document contains each redaction
 - Add wildly creative speculation about what's hidden
-- Be absurdist and funny
 
 **TWEETS** (update_tweets):
-- 3-4 viral-worthy tweets, max 280 chars each
-- Slightly unhinged energy, ironic hashtags
+- 3-4 viral-worthy tweets about the document collection
+- Reference specific documents when juicy
 - #NothingToSeeHere #TotallyNormal
 
 **SUMMARY** (update_summary):
-- 2-3 sentences MAX
-- What is this document and why should anyone care?
-- Be concise and witty
+- 2-3 sentences about the overall document collection
+- What's the story these documents tell together?
 
 Keep humor absurdist and playful. Never mean-spirited.
+
+NOTE: Large PDFs (>4.5MB) are provided as extracted text in XML format.
+Smaller PDFs are sent as native documents. Analyze both the same way.
 """
 
 strands_agent = Agent(
