@@ -14,10 +14,9 @@ interface AnalysisProposalCardProps {
 export function AnalysisProposalCard({
   fileName,
   proposedAnalyses,
-  status,
   onApprove,
   onDeny,
-}: AnalysisProposalCardProps) {
+}: Omit<AnalysisProposalCardProps, "status">) {
   const [responded, setResponded] = useState<"approved" | "denied" | null>(null);
 
   const handleApprove = () => {
