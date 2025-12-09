@@ -319,6 +319,20 @@ def build_investigator_prompt(input_data, user_message: str):
     logger = logging.getLogger("agent.context")
     logger.info(f"build_investigator_prompt called with message: {user_message[:100]}...")
 
+    # DEBUG: Log what we're receiving
+    logger.info(f"input_data type: {type(input_data)}")
+    logger.info(f"input_data attrs: {dir(input_data)}")
+    state_raw = getattr(input_data, "state", None)
+    logger.info(f"state type: {type(state_raw)}, is dict: {isinstance(state_raw, dict)}")
+    if isinstance(state_raw, dict):
+        logger.info(f"state keys: {list(state_raw.keys())}")
+        uploaded_files = state_raw.get("uploadedFiles", [])
+        logger.info(f"uploadedFiles count: {len(uploaded_files)}")
+        for i, f in enumerate(uploaded_files[:3]):  # Log first 3
+            logger.info(f"  file[{i}]: name={f.get('name')}, base64_len={len(f.get('base64', ''))}")
+    else:
+        logger.warning(f"state is not a dict: {state_raw}")
+
     # Reset state accumulator at start of each request
     # This ensures parallel tool calls in this batch accumulate properly
     _reset_state_accumulator()
@@ -677,6 +691,79 @@ agui_agent = StrandsAgent(
 )
 
 app = create_strands_app(agui_agent, "/")
+
+
+# === Debug Middleware to Log Raw Request Body ===
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+import copy
+
+
+class RequestLoggingMiddleware(BaseHTTPMiddleware):
+    """Log raw request body to debug state transmission issues."""
+
+    async def dispatch(self, request: Request, call_next):
+        logger = logging.getLogger("agent.middleware")
+
+        if request.method == "POST":
+            # Read the body
+            body = await request.body()
+            body_str = body.decode("utf-8", errors="replace")
+
+            # Log body size and structure
+            logger.info(f"Request to {request.url.path}: {len(body)} bytes")
+
+            # Try to parse as JSON and check for state
+            try:
+                import json
+                data = json.loads(body_str)
+
+                # Log top-level keys
+                if isinstance(data, dict):
+                    logger.info(f"Request keys: {list(data.keys())}")
+
+                    # Check for state in various locations
+                    if "state" in data:
+                        state = data["state"]
+                        logger.info(f"Found 'state' at root: keys={list(state.keys()) if isinstance(state, dict) else type(state)}")
+                        if isinstance(state, dict) and "uploadedFiles" in state:
+                            files = state["uploadedFiles"]
+                            logger.info(f"  uploadedFiles: {len(files)} files")
+
+                    # Check for messages array (AG-UI protocol)
+                    if "messages" in data:
+                        logger.info(f"Found 'messages': {len(data['messages'])} messages")
+
+                    # Check for agent_state (AG-UI might use this)
+                    if "agent_state" in data:
+                        agent_state = data["agent_state"]
+                        logger.info(f"Found 'agent_state': keys={list(agent_state.keys()) if isinstance(agent_state, dict) else type(agent_state)}")
+
+                    # Log first 500 chars of body for debugging (redact base64)
+                    preview = body_str[:500]
+                    if len(preview) > 100:
+                        # Redact base64 data
+                        import re
+                        preview = re.sub(r'[A-Za-z0-9+/=]{100,}', '[BASE64]', preview)
+                    logger.info(f"Body preview: {preview}...")
+
+            except json.JSONDecodeError:
+                logger.warning(f"Body is not valid JSON: {body_str[:200]}...")
+
+            # Create new request with the body we consumed
+            # FastAPI needs this since we consumed the body
+            async def receive():
+                return {"type": "http.request", "body": body}
+
+            request = Request(request.scope, receive)
+
+        response = await call_next(request)
+        return response
+
+
+# Add middleware for debugging
+app.add_middleware(RequestLoggingMiddleware)
+
 
 if __name__ == "__main__":
     import uvicorn
