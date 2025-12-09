@@ -296,48 +296,27 @@ def update_summary(summary_content: dict) -> Optional[str]:
 # === State Context Builder ===
 
 
-def _sanitize_document_name(name: str) -> str:
-    """Sanitize document name for Bedrock API requirements.
-
-    Bedrock only allows: alphanumeric, whitespace, hyphens, parentheses, square brackets.
-    No consecutive whitespace allowed.
-    """
-    # Replace disallowed characters with hyphens
-    sanitized = re.sub(r'[^a-zA-Z0-9\s\-\(\)\[\]]', '-', name)
-    # Collapse consecutive whitespace to single space
-    sanitized = re.sub(r'\s+', ' ', sanitized)
-    # Collapse consecutive hyphens
-    sanitized = re.sub(r'-+', '-', sanitized)
-    # Remove leading/trailing whitespace and hyphens
-    sanitized = sanitized.strip(' -')
-    # Ensure we have a valid name
-    return sanitized if sanitized else "document"
-
-
 def build_investigator_prompt(input_data, user_message: str):
-    """Inject files and analysis state into the prompt."""
+    """Inject files and analysis state into the prompt.
+
+    Always extracts text from PDFs - never uses Bedrock document blocks.
+    This avoids Bedrock's 5-document limit which applies across conversation history.
+    """
     logger = logging.getLogger("agent.context")
 
     # Reset state accumulator at start of each request
-    # This ensures parallel tool calls in this batch accumulate properly
     _reset_state_accumulator()
 
     state_dict = getattr(input_data, "state", None)
     logger.debug(f"State keys: {list(state_dict.keys()) if isinstance(state_dict, dict) else 'None'}")
 
     context_parts = []
-    content_blocks = []
-    extracted_texts = []  # For files > 4.5MB or overflow beyond 5-doc limit
-
-    # Bedrock limits
-    MAX_DOCUMENT_SIZE_MB = 4.5
-    MAX_DOCUMENT_SIZE_BYTES = int(MAX_DOCUMENT_SIZE_MB * 1024 * 1024)
-    MAX_NATIVE_DOCUMENTS = 5  # Bedrock limit per message
+    extracted_texts = []
 
     if isinstance(state_dict, dict):
         uploaded_files = state_dict.get("uploadedFiles", [])
-        native_doc_count = 0  # Track documents sent as native PDF
 
+        # Always extract text from ALL PDFs (no document blocks)
         for file_info in uploaded_files:
             file_name = file_info.get("name", "document.pdf")
             base64_data = file_info.get("base64", "")
@@ -348,49 +327,22 @@ def build_investigator_prompt(input_data, user_message: str):
             try:
                 pdf_bytes = base64.b64decode(base64_data)
                 file_size_mb = len(pdf_bytes) / (1024 * 1024)
+                logger.info(f"Extracting text from PDF: {file_name} ({file_size_mb:.1f}MB)")
 
-                # Determine if we should extract text:
-                # 1. File > 4.5MB (too large for Bedrock)
-                # 2. Already have 5 native docs (Bedrock limit)
-                should_extract = (
-                    len(pdf_bytes) > MAX_DOCUMENT_SIZE_BYTES
-                    or native_doc_count >= MAX_NATIVE_DOCUMENTS
-                )
-
-                if should_extract:
-                    reason = "size" if len(pdf_bytes) > MAX_DOCUMENT_SIZE_BYTES else "doc limit"
-                    logger.info(f"Extracting text from PDF ({reason}): {file_name} ({file_size_mb:.1f}MB)")
-                    text = extract_text_from_pdf(pdf_bytes, file_name)
-
-                    if text:
-                        extracted_texts.append({"name": file_name, "content": text})
-                        context_parts.append(f"File: {file_name} ({file_size_mb:.1f}MB) - text extracted ({reason})")
-                    else:
-                        context_parts.append(f"File: {file_name} - text extraction failed")
+                text = extract_text_from_pdf(pdf_bytes, file_name)
+                if text:
+                    extracted_texts.append({"name": file_name, "content": text})
                 else:
-                    # Small file within limit: send as PDF document block
-                    safe_name = _sanitize_document_name(file_name)
-                    unique_name = f"{safe_name}-{uuid.uuid4().hex[:8]}"
-                    content_blocks.append(
-                        {
-                            "document": {
-                                "format": "pdf",
-                                "name": unique_name,
-                                "source": {"bytes": pdf_bytes},
-                            },
-                        }
-                    )
-                    native_doc_count += 1
-                    context_parts.append(f"File: {file_name} ({file_size_mb:.1f}MB) - native PDF")
+                    context_parts.append(f"File: {file_name} - text extraction failed")
 
             except Exception as e:
                 logger.error(f"Failed to process {file_name}: {e}")
                 context_parts.append(f"File: {file_name} (error: {e})")
 
-        # Add extracted text as XML if any
+        # Add extracted text as XML
         if extracted_texts:
             xml_content = format_extracted_files_as_xml(extracted_texts)
-            context_parts.append(f"\nExtracted text from {len(extracted_texts)} large file(s):")
+            context_parts.append(f"Extracted text from {len(extracted_texts)} PDF(s):")
             context_parts.append(xml_content)
 
         status = state_dict.get("analysisStatus", "idle")
@@ -407,11 +359,6 @@ def build_investigator_prompt(input_data, user_message: str):
         if text_context
         else user_message
     )
-
-    if content_blocks:
-        content_blocks.append({"text": full_text})
-        logger.info(f"Returning multimodal content with {len(content_blocks)} blocks ({native_doc_count} native PDFs)")
-        return content_blocks
 
     logger.info(f"Returning text-only prompt ({len(full_text)} chars)")
     return full_text
@@ -653,8 +600,7 @@ When analyzing PDFs (you may receive multiple files):
 
 Keep humor absurdist and playful. Never mean-spirited.
 
-NOTE: Large PDFs (>4.5MB) are provided as extracted text in XML format.
-Smaller PDFs are sent as native documents. Analyze both the same way.
+NOTE: All PDFs are provided as extracted text in XML format.
 """
 
 strands_agent = Agent(
